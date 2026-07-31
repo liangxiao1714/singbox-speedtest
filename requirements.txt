@@ -1,0 +1,6 @@
+# karing-speedtest 无第三方 Python 依赖
+# 仅需 Python 3.8+ 标准库（http.server, subprocess, json, threading 等）
+#
+# 外部二进制依赖（非 pip 包，见 README.md）:
+#   - sing-box.exe  : 用于启动临时代理实例（必需）
+#   - curl          : 用于下载测速（Windows 10+ / Linux / macOS 自带）

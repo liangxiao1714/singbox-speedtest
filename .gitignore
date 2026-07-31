@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# 运行时生成的历史记录（用户私有数据）
+singbox_speedtest_history.json
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
