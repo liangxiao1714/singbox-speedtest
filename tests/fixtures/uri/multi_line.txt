@@ -1,0 +1,6 @@
+vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=example.com&type=ws&path=%2Fvless-ws&host=example.com&fp=chrome#🇯🇵日本01
+vmess://eyJ2IjoiMiIsInBzIjoiSlAtMDEiLCJhZGQiOiJleGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTExMTEtMTExMS0xMTExLTExMTExMTExMTExMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJleGFtcGxlLmNvbSIsInBhdGgiOiIvdm1lc3Mtd3MiLCJ0bHMiOiJ0bHMiLCJzbmkiOiJleGFtcGxlLmNvbSIsImFscG4iOiIiLCJmcCI6ImNocm9tZSJ9#🇯🇵日本02
+trojan:fake-secret-123@example.net:443?security=tls&sni=example.net&type=ws&path=%2Ftrojan-ws#🇸🇬新加坡01
+ss://YWVzLTI1Ni1nY206dGVzdC1wYXNzd29yZA==@example.com:20001#🇸🇬新加坡02
+hysteria2://password@sub.example.com:8443?sni=sub.example.com&obfs=salamander&obfs-password=obfs-password#🇺🇸美国01
+tuic://11111111-1111-1111-1111-111111111111:password@example.org:20004?sni=example.org&congestion_control=bbr&alpn=h3#🇺🇸美国02

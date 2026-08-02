@@ -1,0 +1,10 @@
+proxies:
+  - name: JP-01
+    type: vless
+    server: example.com
+    port: 443
+	tab-indented-line: this line uses a tab which is invalid in YAML
+  - name: US-02
+   type: trojan
+    server: example.org
+   port: 443

@@ -1,0 +1,3 @@
+hysteria2://password@example.com:443?sni=example.com#🇯🇵日本01
+hysteria2://password@sub.example.com:8443?sni=sub.example.com&insecure=0&obfs=salamander&obfs-password=obfs-password&alpn=h3#🇸🇬新加坡02
+hysteria2://dummy@example.org:20003?sni=example.org&obfs=salamander&obfs-password=obfs-password&up=100&down=200#🇺🇸美国03

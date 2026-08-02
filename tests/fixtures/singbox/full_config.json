@@ -1,0 +1,116 @@
+{
+  "_comment": "Desensitized sing-box full config fixture. All values are RFC-reserved fakes (RFC 2606/3849/5737). Covers the 6 first-phase protocols (vless, vmess, trojan, shadowsocks, hysteria2, tuic) + direct + block. For parser/regression tests ONLY; not a working production config.",
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      { "tag": "dns-remote", "address": "https://dns.example.com/dns-query", "detour": "direct" },
+      { "tag": "dns-local", "address": "rcode", "address_resolver": "dns-remote" }
+    ],
+    "rules": [],
+    "final": "dns-remote",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-vision",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "example.com", "server_port": 443 },
+          "private_key": "fake-private-key-base64",
+          "short_id": "deadbeef"
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls",
+      "server": "example.org",
+      "server_port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": {
+        "enabled": true,
+        "server_name": "example.org",
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vmess-ws",
+        "headers": { "Host": "example.org" }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc-sni",
+      "server": "example.net",
+      "server_port": 443,
+      "password": "fake-secret-123",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.net"
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "grpc-service"
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-2022",
+      "server": "203.0.113.10",
+      "server_port": 20000,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "test-password"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-obfs",
+      "server": "sub.example.com",
+      "server_port": 8443,
+      "password": "dummy",
+      "obfs": { "type": "salamander", "password": "obfs-password" },
+      "tls": {
+        "enabled": true,
+        "server_name": "sub.example.com",
+        "alpn": ["h3"]
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-bbr",
+      "server": "example.org",
+      "server_port": 20001,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "password": "password",
+      "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.org",
+        "alpn": ["h3"]
+      }
+    },
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
+  ],
+  "route": {
+    "rules": [],
+    "final": "direct"
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "_comment": "Desensitized Karing items[].servers fixture (RFC-reserved fakes only). Each server entry mixes sing-box outbound fields with Karing metadata (attach, groupid, latency, outlet_ip, outlet_region, domain_resolver) that _SUB_DROP_KEYS in singbox_speedtest.py must strip. Exercises the primary _scan_from_subscribe path.",
+  "items": [
+    {
+      "groupid": "g1",
+      "remark": "示例订阅A",
+      "servers": [
+        {
+          "type": "vless",
+          "tag": "JP-A-vless-reality",
+          "server": "example.com",
+          "server_port": 443,
+          "uuid": "11111111-1111-1111-1111-111111111111",
+          "flow": "xtls-rprx-vision",
+          "tls": {
+            "enabled": true,
+            "server_name": "example.com",
+            "utls": { "enabled": true, "fingerprint": "chrome" },
+            "reality": {
+              "enabled": true,
+              "public_key": "fake-public-key-base64",
+              "short_id": "deadbeef"
+            }
+          },
+          "attach": "karing-extra-attach-A1",
+          "groupid": "g1",
+          "latency": 120,
+          "outlet_ip": "203.0.113.20",
+          "outlet_region": "JP",
+          "domain_resolver": "default"
+        },
+        {
+          "type": "vmess",
+          "tag": "JP-A-vmess-ws",
+          "server": "example.org",
+          "server_port": 443,
+          "uuid": "11111111-1111-1111-1111-111111111111",
+          "security": "auto",
+          "alter_id": 0,
+          "tls": { "enabled": true, "server_name": "example.org" },
+          "transport": {
+            "type": "ws",
+            "path": "/vmess-ws",
+            "headers": { "Host": "example.org" }
+          },
+          "attach": "karing-extra-attach-A2",
+          "groupid": "g1",
+          "latency": 210,
+          "outlet_ip": "203.0.113.21",
+          "outlet_region": "JP",
+          "domain_resolver": "default"
+        }
+      ]
+    },
+    {
+      "groupid": "g2",
+      "remark": "示例订阅B",
+      "servers": [
+        {
+          "type": "trojan",
+          "tag": "SG-B-trojan-grpc",
+          "server": "example.net",
+          "server_port": 443,
+          "password": "fake-secret-123",
+          "tls": { "enabled": true, "server_name": "example.net" },
+          "transport": { "type": "grpc", "service_name": "grpc-svc" },
+          "attach": "karing-extra-attach-B1",
+          "groupid": "g2",
+          "latency": 305,
+          "outlet_ip": "198.51.100.30",
+          "outlet_region": "SG",
+          "domain_resolver": "default"
+        },
+        {
+          "type": "shadowsocks",
+          "tag": "SG-B-ss-2022",
+          "server": "203.0.113.12",
+          "server_port": 20003,
+          "method": "2022-blake3-aes-128-gcm",
+          "password": "test-password",
+          "attach": "karing-extra-attach-B2",
+          "groupid": "g2",
+          "latency": 88,
+          "outlet_ip": "198.51.100.31",
+          "outlet_region": "SG",
+          "domain_resolver": "default"
+        },
+        {
+          "type": "tuic",
+          "tag": "US-B-tuic-bbr",
+          "server": "sub.example.com",
+          "server_port": 20004,
+          "uuid": "11111111-1111-1111-1111-111111111111",
+          "password": "password",
+          "congestion_control": "bbr",
+          "tls": { "enabled": true, "server_name": "sub.example.com" },
+          "attach": "karing-extra-attach-B3",
+          "groupid": "g2",
+          "latency": 410,
+          "outlet_ip": "198.51.100.32",
+          "outlet_region": "US",
+          "domain_resolver": "default"
+        }
+      ]
+    }
+  ]
+}

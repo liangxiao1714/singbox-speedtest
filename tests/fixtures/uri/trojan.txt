@@ -1,0 +1,3 @@
+trojan:fake-secret-123@example.com:443#🇯🇵日本01
+trojan:fake-secret-123@example.net:443?security=tls&sni=example.net&type=ws&path=%2Ftrojan-ws&host=example.net#🇸🇬新加坡02
+trojan:password@sub.example.org:8443?security=tls&sni=sub.example.org&type=grpc&serviceName=grpc-svc&allowInsecure=0#🇺🇸美国03

@@ -1,0 +1,103 @@
+# Desensitized Mihomo/Clash proxies fixture (RFC-reserved fakes only).
+# Covers vless/vmess/trojan/shadowsocks with TLS, SNI, WS transport (ws-opts),
+# gRPC (grpc-opts), reality (reality-opts) and utls fingerprint (client-fingerprint).
+# For parser/converter tests ONLY; rules/policy-groups intentionally omitted.
+proxies:
+  - name: "vless-reality-vision"
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    flow: xtls-rprx-vision
+    servername: example.com
+    reality-opts:
+      public-key: fake-public-key-base64
+      short-id: deadbeef
+    client-fingerprint: chrome
+    network: tcp
+
+  - name: "vless-ws-tls"
+    type: vless
+    server: sub.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    servername: sub.example.com
+    client-fingerprint: chrome
+    network: ws
+    ws-opts:
+      path: /vless-ws
+      headers:
+        Host: sub.example.com
+
+  - name: "vmess-ws-tls"
+    type: vmess
+    server: example.org
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: example.org
+    skip-cert-verify: false
+    network: ws
+    ws-opts:
+      path: /vmess-ws
+      headers:
+        Host: example.org
+
+  - name: "vmess-grpc"
+    type: vmess
+    server: example.net
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: example.net
+    network: grpc
+    grpc-opts:
+      grpc-service-name: grpc-svc
+
+  - name: "trojan-grpc-sni"
+    type: trojan
+    server: example.net
+    port: 443
+    password: fake-secret-123
+    sni: example.net
+    skip-cert-verify: false
+    network: grpc
+    grpc-opts:
+      grpc-service-name: grpc-svc
+
+  - name: "trojan-ws"
+    type: trojan
+    server: sub.example.org
+    port: 8443
+    password: password
+    sni: sub.example.org
+    network: ws
+    ws-opts:
+      path: /trojan-ws
+      headers:
+        Host: sub.example.org
+
+  - name: "ss-2022"
+    type: ss
+    server: 203.0.113.10
+    port: 20000
+    cipher: 2022-blake3-aes-128-gcm
+    password: test-password
+
+  - name: "ss-aes-gcm-plugin"
+    type: ss
+    server: 198.51.100.20
+    port: 20001
+    cipher: aes-256-gcm
+    password: dummy
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      tls: true
+      host: example.com
+      path: /ss-ws

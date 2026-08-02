@@ -1,0 +1,6 @@
+{
+  "outbounds": [
+    {"type": "vless", "tag": "JP-01", "server": "example.com",
+  ],
+  "version": 1,
+}

@@ -1,0 +1,49 @@
+[
+  {
+    "type": "vless",
+    "tag": "vless-ws-tls",
+    "server": "example.com",
+    "server_port": 443,
+    "uuid": "11111111-1111-1111-1111-111111111111",
+    "tls": {
+      "enabled": true,
+      "server_name": "example.com",
+      "utls": { "enabled": true, "fingerprint": "chrome" }
+    },
+    "transport": {
+      "type": "ws",
+      "path": "/vless-ws",
+      "headers": { "Host": "example.com" }
+    }
+  },
+  {
+    "type": "trojan",
+    "tag": "trojan-sni",
+    "server": "example.net",
+    "server_port": 443,
+    "password": "fake-secret-123",
+    "tls": {
+      "enabled": true,
+      "server_name": "example.net"
+    }
+  },
+  {
+    "type": "shadowsocks",
+    "tag": "ss-aes-gcm",
+    "server": "203.0.113.11",
+    "server_port": 20002,
+    "method": "aes-256-gcm",
+    "password": "test-password"
+  },
+  {
+    "type": "vmess",
+    "tag": "vmess-grpc",
+    "server": "example.org",
+    "server_port": 443,
+    "uuid": "11111111-1111-1111-1111-111111111111",
+    "security": "auto",
+    "alter_id": 0,
+    "tls": { "enabled": true, "server_name": "example.org" },
+    "transport": { "type": "grpc", "service_name": "grpc-svc" }
+  }
+]

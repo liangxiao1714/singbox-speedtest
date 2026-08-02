@@ -1,0 +1,63 @@
+{
+  "_comment": "Desensitized Clash/Mihomo JSON config fragment (RFC-reserved fakes only). Same proxies[] shape as YAML variant; rules/policy-groups omitted. For parser/converter tests ONLY.",
+  "proxies": [
+    {
+      "name": "vless-ws-tls",
+      "type": "vless",
+      "server": "example.com",
+      "port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "tls": true,
+      "servername": "example.com",
+      "client-fingerprint": "chrome",
+      "network": "ws",
+      "ws-opts": {
+        "path": "/vless-ws",
+        "headers": { "Host": "example.com" }
+      }
+    },
+    {
+      "name": "vmess-grpc",
+      "type": "vmess",
+      "server": "example.org",
+      "port": 443,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "alterId": 0,
+      "cipher": "auto",
+      "tls": true,
+      "servername": "example.org",
+      "network": "grpc",
+      "grpc-opts": { "grpc-service-name": "grpc-svc" }
+    },
+    {
+      "name": "trojan-sni",
+      "type": "trojan",
+      "server": "example.net",
+      "port": 443,
+      "password": "fake-secret-123",
+      "sni": "example.net",
+      "skip-cert-verify": false
+    },
+    {
+      "name": "ss-2022",
+      "type": "ss",
+      "server": "203.0.113.11",
+      "port": 20002,
+      "cipher": "2022-blake3-aes-128-gcm",
+      "password": "test-password"
+    },
+    {
+      "name": "tuic-bbr",
+      "type": "tuic",
+      "server": "sub.example.com",
+      "port": 20003,
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "password": "password",
+      "congestion-controller": "bbr",
+      "udp-relay-mode": "native",
+      "alpn": ["h3"],
+      "sni": "sub.example.com",
+      "skip-cert-verify": false
+    }
+  ]
+}
