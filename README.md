@@ -156,10 +156,11 @@ python singbox_speedtest.py
 **方式 A（推荐，零额外操作）**：如果你已安装 v2rayN / Karing 等含 sing-box 的客户端，直接复用其自带的 sing-box，工具会自动发现。
 
 **方式 B**：从 [sing-box 官方 Release](https://github.com/SagerNet/sing-box/releases) 下载，解压后：
-- 放入系统 PATH（推荐），或
+- 放入项目 `bin/` 子目录（推荐，`sing-box.exe` + `libcronet.dll` 一起放入，工具自动发现），或
+- 放入系统 PATH，或
 - 用 `--singbox` 参数指定完整路径
 
-工具查找 sing-box 的优先级：系统 PATH → v2rayN 常见安装路径 → `--singbox` 参数指定。
+工具查找 sing-box 的优先级：项目 `bin/` 子目录 → 系统 PATH → v2rayN 常见安装路径 → `--singbox` 参数指定。
 
 ---
 
@@ -169,13 +170,23 @@ python singbox_speedtest.py
 
 ### 独立部署（推荐）
 
-把项目放在任意独立目录即可：
+把项目放在任意独立目录即可，推荐目录结构：
 
 ```
 任意目录/
 └── singbox-speedtest/
-    └── singbox_speedtest.py
+    ├── singbox_speedtest.py
+    ├── bin/                  # sing-box.exe（可选，放入后自动发现）
+    │   ├── sing-box.exe
+    │   └── libcronet.dll
+    ├── config/               # 配置源（主推位置）
+    │   ├── service_core.json
+    │   └── karing_subscribe.json   # 可选
+    └── data/                 # 自动生成，存放测速历史
+        └── singbox_speedtest_history.json
 ```
+
+> 没有任何目录也能运行——只要用 `--core` / `--config-dir` 指定配置文件即可。`config/`、`data/`、`bin/` 在首次运行时按需自动创建。
 
 工具只做两件事，均与代理客户端的运行状态无关：
 1. **读取** sing-box 格式的配置文件来获取节点列表 —— 配置源客户端（如 Karing）无需运行，只要配置文件存在
@@ -222,7 +233,9 @@ python singbox_speedtest.py
 6. 点节点名或 **详情** 查看阶段日志、出口 IP、地理位置
 7. 点 **历史** 查看历史测速记录，对比稳定性
 
-> 局域网其他设备也可通过 `http://你的IP:8088` 访问。
+> **订阅更新后无需重启**：在代理客户端刷新订阅生成新的 `service_core.json` 后，点界面上的 **↻ 重新载入** 按钮即可热加载最新节点列表（测速进行中会暂时禁用，避免冲突）。历史记录按节点稳定身份关联，新配置里同服务器的节点会自动延续历史趋势。
+
+> **默认仅本机访问**：为避免将未认证的 Web 接口暴露到局域网，Web 服务默认只监听 `127.0.0.1`。如需从其他设备访问，需在引入认证方案后通过 `--host` 显式指定监听地址（当前版本非回环地址会被拒绝启动）。
 
 ### 命令行模式
 
@@ -247,11 +260,14 @@ python singbox_speedtest.py --singbox "/path/to/sing-box.exe"
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--core` | 自动定位 | sing-box 配置文件（`service_core.json`）路径 |
-| `--subscribe` | 自动定位 | 订阅分组文件路径（可选，用于订阅分组显示，如 Karing 的 `karing_subscribe.json`）|
+| `--subscribe` | 自动定位 | 订阅分组文件路径（可选，用于订阅分组显示，如 `karing_subscribe.json`）|
+| `--config-dir` | 项目 `config/` | 配置文件目录，下含 `service_core.json` / `karing_subscribe.json` |
+| `--history` | 项目 `data/` | 测速历史文件路径 |
 | `--singbox` | 自动查找 | `sing-box` / `sing-box.exe` 路径 |
 | `--bytes` | 10485760 | 测速下载字节数（默认 10MB）|
 | `--timeout` | 25 | 单节点测速超时秒数 |
 | `--port` | 8088 | Web 界面端口 |
+| `--host` | `127.0.0.1` | Web 监听地址（默认仅回环；非回环地址在认证方案落地前会被拒绝）|
 | `--cli` | - | 启用命令行模式（不启动 Web）|
 | `--filter` | - | 节点名筛选关键字（CLI 模式）|
 
@@ -291,20 +307,21 @@ sing-box 配置                      本工具
 
 ## 配置文件位置
 
-工具默认从常见代理客户端的配置目录读取 sing-box 配置：
+工具按以下**优先级**查找 `service_core.json`（取第一个存在者）：
 
-| 配置源 | 配置文件 | 默认查找路径（Windows）|
-|--------|---------|----------------------|
-| Karing | `service_core.json` | `%APPDATA%\karing\karing\` |
-| 其他 | 任意 sing-box 配置 | 用 `--core` 参数指定 |
+| 优先级 | 来源 | 说明 |
+|--------|------|------|
+| 1 | `--core` / `--subscribe` 参数 | 最高优先，直接指定文件 |
+| 2 | 环境变量 `SINGBOX_SPEEDTEST_CORE` / `..._SUB` | 适合脚本/快捷方式固化 |
+| 3 | `--config-dir` 指定目录 | 一次性指定两者所在目录 |
+| 4 | 项目 `config/service_core.json` | **主推约定位置** |
+| 5 | 项目根 `service_core.json` | 平铺部署兼容 |
 
-订阅分组文件（可选，用于订阅分组显示）：
+> 任一来源都行——只要文件是 sing-box 格式（含 `outbounds` 数组）。例如配置来自 Karing：把 `%APPDATA%\karing\karing\service_core.json` 复制到项目 `config/`，或用 `--core` 直接指向原路径。
 
-| 配置源 | 订阅文件 | 说明 |
-|--------|---------|------|
-| Karing | `karing_subscribe.json` | 含订阅 remark 与节点对应关系 |
+订阅分组文件（可选，用于订阅分组显示）：同优先级链查找 `karing_subscribe.json`。
 
-测速历史记录保存在配置文件同目录下的 `singbox_speedtest_history.json`（每节点最多 50 条）。
+测速历史记录保存在项目 `data/singbox_speedtest_history.json`（每节点最多 50 条）。**历史按节点的稳定身份 `{协议}:{服务器}:{端口}`（含传输层/TLS 指纹）关联**，而非按节点名——因此订阅更新、节点改名后，历史趋势仍能准确关联到同一服务器；仅在服务器/端口/协议变化时才视为新节点。
 
 ---
 
@@ -313,8 +330,8 @@ sing-box 配置                      本工具
 **Q: 启动报错"找不到 sing-box"？**
 A: sing-box 不在 PATH 且未装 v2rayN 等客户端。用 `--singbox` 参数指定 sing-box 完整路径，或将其加入系统 PATH。
 
-**Q: 启动报错"找不到配置 service_core.json"？**
-A: 用 `--core` 参数指定你的 sing-box 配置文件路径。该文件通常由代理客户端（如 Karing）运行后生成。
+**Q: 启动报错"找不到配置文件"？**
+A: 把 sing-box 配置（`service_core.json`）放入项目 `config/` 目录，或用 `--core` / `--config-dir` 指定路径。该文件通常由代理客户端（如 Karing）运行后生成，可直接复制过来。
 
 **Q: 测速时正在使用的代理会受影响吗？**
 A: 不会。本工具为每个节点启动独立的临时 sing-box 实例（使用不同的本地端口），与正在运行的代理客户端完全隔离。
@@ -329,7 +346,7 @@ A: Ping（sing-box 模式）远比 TCP 探测有参考价值——它测的是�
 A: 每个节点测速受 `--timeout` 控制（默认 25s），超时自动跳过。慢节点或被限流的测速源会自动降级到备用源。看「详情」面板的阶段日志可知卡在哪一步。
 
 **Q: 历史记录在哪？能清除吗？**
-A: 在配置文件同目录的 `singbox_speedtest_history.json`。删除该文件即可清除全部历史。
+A: 在项目 `data/singbox_speedtest_history.json`。删除该文件即可清除全部历史。历史按节点稳定身份（`协议:服务器:端口` + 传输/TLS 指纹）关联，订阅更新或节点改名后仍能延续趋势。
 
 **Q: 支持 clash/mihomo 的配置吗？**
 A: 当前仅支持 sing-box 格式（`outbounds` 数组）。clash 格式需先用客户端转换或手动转成 sing-box 格式。

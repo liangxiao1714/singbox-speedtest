@@ -24,9 +24,11 @@ sing-box 多节点测速工具
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -37,7 +39,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ======================== 默认配置 ========================
-DEFAULT_KARING_DIR = os.path.join(os.environ.get("APPDATA", ""), "karing", "karing")
+# 项目目录约定：配置源放在 config/，历史放在 data/，sing-box 二进制放在 bin/
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR = os.path.join(PROJECT_DIR, "config")
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+HISTORY_JSON = "singbox_speedtest_history.json"
 CORE_JSON = "service_core.json"
 SUB_JSON = "karing_subscribe.json"
 DEFAULT_SINGBOX = ""  # 留空则自动查找（PATH 环境变量 / v2rayN 常见安装位置）
@@ -58,8 +64,12 @@ PROXY_TYPES = {"vless", "vmess", "trojan", "hysteria", "hysteria2", "shadowsocks
 
 
 def find_singbox():
-    # 按优先级查找 sing-box：PATH → v2rayN 常见安装位置
+    # 按优先级查找 sing-box：脚本目录（自带）→ PATH → v2rayN 常见安装位置
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        # 脚本自带（项目 bin 子目录 / 项目根目录），实现自包含部署
+        os.path.join(_script_dir, "bin", "sing-box.exe"),
+        os.path.join(_script_dir, "sing-box.exe"),
         "sing-box",  # 系统 PATH（Linux/macOS/已加入PATH的Windows）
         "sing-box.exe",
         # v2rayN 常见安装位置（Windows）
@@ -78,6 +88,119 @@ def find_singbox():
     return DEFAULT_SINGBOX
 
 
+def make_id(outbound):
+    """节点稳定关联键（用于测速历史跨订阅更新关联）。
+    基础 = '{type}:{server}:{port}'；若节点含传输层/TLS 结构性差异字段（CDN 前置、
+    多 SNI / Reality / WS路径等共用同一 server:port 的情况），追加这些字段的指纹
+    哈希后缀以消歧。**不含密钥/密码/uuid/tag**：改密、改名、订阅重组不影响关联，
+    仅在协议/服务器/端口/传输结构变化时才视为新节点。"""
+    t = str(outbound.get("type", "")).lower()
+    server = str(outbound.get("server", "")).lower()
+    port = outbound.get("server_port") or outbound.get("server_ports") or ""
+    base = f"{t}:{server}:{port}"
+    fp = _structural_fingerprint(outbound, t)
+    if fp:
+        h = hashlib.md5(fp.encode("utf-8")).hexdigest()[:8]
+        return f"{base}#{h}"
+    return base
+
+
+def _structural_fingerprint(outbound, t):
+    """提取用于区分'共用 type:server:port'节点的结构性字段（不含密钥/密码/tag）。
+    返回排序后的 'k=v|k=v' 串；无差异字段时返回 ''。"""
+    parts = []
+    tp = outbound.get("transport") or {}
+    if isinstance(tp, dict):
+        for k in ("type", "path", "service_name", "server_name"):
+            v = tp.get(k)
+            if v:
+                parts.append(f"tp{k}={v}")
+    tls = outbound.get("tls") or {}
+    if isinstance(tls, dict):
+        if tls.get("server_name"):
+            parts.append(f"sni={tls.get('server_name')}")
+        if tls.get("insecure"):
+            parts.append("insec=1")
+        alpn = tls.get("alpn")
+        if alpn:
+            parts.append("alpn=" + ("+".join(alpn) if isinstance(alpn, list) else str(alpn)))
+        reality = tls.get("reality") or {}
+        if isinstance(reality, dict) and reality.get("enabled"):
+            if reality.get("public_key"):
+                parts.append(f"rpk={reality.get('public_key')}")
+            if reality.get("short_id"):
+                parts.append(f"rsi={reality.get('short_id')}")
+        utls = tls.get("utls") or {}
+        if isinstance(utls, dict) and utls.get("enabled") and utls.get("fingerprint"):
+            parts.append(f"utls={utls.get('fingerprint')}")
+    if t == "shadowsocks":
+        if outbound.get("method"):
+            parts.append(f"method={outbound.get('method')}")
+    elif t == "hysteria2":
+        obfs = outbound.get("obfs")
+        if isinstance(obfs, dict) and obfs.get("type"):
+            parts.append(f"obfs={obfs.get('type')}")
+        if outbound.get("up"):
+            parts.append(f"up={outbound.get('up')}")
+        if outbound.get("down"):
+            parts.append(f"down={outbound.get('down')}")
+    parts.sort()
+    return "|".join(parts)
+
+
+def _resolve_in_order(name, cli_arg, env_key, extra_dirs):
+    """按 (cli_arg → 环境变量 → 各候选目录) 顺序查找名为 name 的文件，
+    返回第一个存在的绝对路径；全部不存在则返回最后一个候选字符串（用于上层
+    做存在性容错或友好报错）。"""
+    candidates = []
+    if cli_arg:
+        candidates.append(cli_arg)
+    env_val = os.environ.get(env_key, "")
+    if env_val:
+        candidates.append(env_val)
+    for d in extra_dirs:
+        candidates.append(os.path.join(d, name))
+    # 第一个存在的直接返回
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    # 全部不存在：返回最后一个候选字符串（若空则返回 name 本身）
+    return candidates[-1] if candidates else name
+
+
+def resolve_core_path(cli_arg, config_dir=None):
+    """按优先级定位 service_core.json：(1) cli_arg → (2) env SINGBOX_SPEEDTEST_CORE
+    → (3) config_dir 下 → (4) CONFIG_DIR → (5) PROJECT_DIR。全不存在返回 None。"""
+    dirs = [d for d in [config_dir, CONFIG_DIR, PROJECT_DIR] if d]
+    found = _resolve_in_order(CORE_JSON, cli_arg, "SINGBOX_SPEEDTEST_CORE", dirs)
+    return found if (found and os.path.exists(found)) else None
+
+
+def resolve_sub_path(cli_arg, config_dir=None):
+    """按优先级定位 karing_subscribe.json：结构同 resolve_core_path（env
+    SINGBOX_SPEEDTEST_SUB）。sub 不存在不致命，返回最终候选路径字符串即可
+    （_scan_nodes 内部对不存在做容错）。"""
+    dirs = [d for d in [config_dir, CONFIG_DIR, PROJECT_DIR] if d]
+    return _resolve_in_order(SUB_JSON, cli_arg, "SINGBOX_SPEEDTEST_SUB", dirs)
+
+
+def resolve_history_path(cli_arg=None):
+    """按优先级定位历史文件：(1) cli_arg → (2) env SINGBOX_SPEEDTEST_HISTORY
+    → (3) DATA_DIR/HISTORY_JSON。函数内确保 DATA_DIR 存在。返回路径字符串。"""
+    candidates = []
+    if cli_arg:
+        candidates.append(cli_arg)
+    env_val = os.environ.get("SINGBOX_SPEEDTEST_HISTORY", "")
+    if env_val:
+        candidates.append(env_val)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
+    candidates.append(os.path.join(DATA_DIR, HISTORY_JSON))
+    return candidates[0] if candidates else os.path.join(DATA_DIR, HISTORY_JSON)
+
+
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -89,14 +212,27 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+def _is_loopback(host):
+    """判断 host 是否为回环地址（127.0.0.1 / ::1 / localhost / 127.*）。"""
+    if not host:
+        return False
+    h = host.strip().lower()
+    return h in ("127.0.0.1", "::1", "localhost") or h.startswith("127.")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="sing-box 多节点测速工具")
     p.add_argument("--core", default=None, help="service_core.json 路径")
     p.add_argument("--subscribe", default=None, help="karing_subscribe.json 路径（用于订阅分组）")
+    p.add_argument("--config-dir", default=None, dest="config_dir",
+                   help="配置文件目录，下含 service_core.json / karing_subscribe.json")
+    p.add_argument("--history", default=None, help="测速历史文件路径")
     p.add_argument("--singbox", default=None, help="sing-box.exe 路径")
     p.add_argument("--bytes", type=int, default=DEFAULT_DL_BYTES, help=f"测速下载字节数（默认 {DEFAULT_DL_BYTES}）")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"单节点测速超时（默认 {DEFAULT_TIMEOUT}s）")
     p.add_argument("--port", type=int, default=8088, help="Web 端口（默认 8088）")
+    # 阶段 0（Section 16.1）：默认监听回环地址，避免暴露未认证的 Web 接口
+    p.add_argument("--host", default="127.0.0.1", help="Web 监听地址（默认 127.0.0.1；阶段 5 前仅允许回环地址）")
     p.add_argument("--cli", action="store_true", help="命令行模式")
     p.add_argument("--filter", default="", help="节点名筛选")
     return p.parse_args()
@@ -104,28 +240,33 @@ def parse_args():
 
 # ======================== 核心逻辑 ========================
 class SpeedTest:
-    def __init__(self, core_path, sub_path, singbox, dl_bytes, timeout):
+    def __init__(self, core_path, sub_path, singbox, dl_bytes, timeout, history_path):
         self.core_path = core_path
         self.sub_path = sub_path
         self.singbox = singbox
         self.dl_bytes = dl_bytes
         self.timeout = timeout
         self.ping_count = 5   # 默认 ping 次数（可前端配置）
-        self.nodes = []         # {tag, type, server, port, subgroup, outbound}
-        self.results = {}       # tag -> result dict
+        self.nodes = []         # {id, tag, type, server, port, subgroup, outbound}
+        self.results = {}       # id -> result dict
         self.lock = threading.RLock()
         self.state = "idle"     # idle/pinging/testing/done/stopping
         self.current = None
         self.progress = {"done": 0, "total": 0}
         self.total_dl = 0       # 累计下载字节
         self.total_ul = 0       # 累计上传字节
-        self.logs = defaultdict(list)   # tag -> [log lines]
+        self.logs = defaultdict(list)   # id -> [log lines]
         self.subgroups = {}     # groupid -> remark
         self.tmp_dir = os.path.join(os.environ.get("TEMP", "/tmp"), "singbox_speedtest")
         os.makedirs(self.tmp_dir, exist_ok=True)
-        self.history_path = os.path.join(os.path.dirname(core_path), "singbox_speedtest_history.json")
+        self.history_path = history_path
+        # 先做历史文件位置迁移（旧位置 = 配置同目录），再加载历史
+        self._migrate_history_location(core_path)
         self.history = self._load_history()
-        self._load()
+        # 历史关联键迁移（旧 tag-keyed → 新 stable_id-keyed）
+        self._apply_nodes(self._scan_nodes())
+        self._migrate_history_keys()
+        self._save_history()  # 确保首次启动即落盘（初始 {}），避免历史文件缺位
 
     def _load_history(self):
         try:
@@ -141,37 +282,165 @@ class SpeedTest:
         except Exception:
             pass
 
-    def _load(self):
-        with open(self.core_path, "r", encoding="utf-8") as f:
-            core = json.load(f)
-        # 订阅映射: tag -> remark
-        tag_to_sub = {}
-        if self.sub_path and os.path.exists(self.sub_path):
+    def _migrate_history_location(self, core_path):
+        """历史文件位置迁移：旧位置 = 配置文件同目录下的 singbox_speedtest_history.json。
+        若 self.history_path 已存在则无需迁移；若旧位置存在则复制（不动原件）到新位置。"""
+        try:
+            if self.history_path and os.path.exists(self.history_path):
+                return
+            old = os.path.join(os.path.dirname(core_path), "singbox_speedtest_history.json")
+            if os.path.exists(old):
+                os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+                shutil.copy2(old, self.history_path)
+                print(f"已迁移历史文件: {old} -> {self.history_path}（原件保留）")
+        except Exception as e:
+            print(f"历史位置迁移跳过: {e}")
+
+    def _migrate_history_keys(self):
+        """历史关联键迁移：旧格式 history 以节点 tag 为 key，新格式以 stable_id
+        （'{type}:{server}:{port}'）为 key。判定逻辑：旧 key 能匹配当前某节点 tag
+        且不等于该节点 id，则迁移；已是新格式的原样保留；无法匹配的存为孤儿备份。"""
+        old = self.history
+        if not old or not isinstance(old, dict):
+            return
+        try:
+            cur_ids = {n["id"] for n in self.nodes}
+            tag_to_id = {n["tag"]: n["id"] for n in self.nodes}
+            new, orphans = {}, {}
+            for key, recs in old.items():
+                if key in cur_ids:
+                    new[key] = recs  # 已是新格式
+                elif key in tag_to_id:
+                    new.setdefault(tag_to_id[key], []).extend(recs)
+                else:
+                    orphans[key] = recs  # 无法匹配 → 孤儿
+            if orphans:
+                try:
+                    backup = self.history_path + ".orphan.bak"
+                    with open(backup, "w", encoding="utf-8") as f:
+                        json.dump(orphans, f, ensure_ascii=False, indent=2)
+                    print(f"警告: {len(orphans)} 条历史无法匹配当前节点，已备份到 {backup}")
+                except Exception:
+                    pass
+            # 迁移前必须先备份原件（绝不静默丢弃用户数据）
+            try:
+                shutil.copy2(self.history_path, self.history_path + ".v1.bak")
+            except Exception:
+                pass
+            self.history = new
+            self._save_history()
+        except Exception as e:
+            print(f"历史键迁移跳过: {e}")
+
+    # subscribe 的 server 项里 Karing 元数据字段（sing-box 不识别，需剔除）
+    _SUB_DROP_KEYS = {"attach", "groupid", "latency", "outlet_ip", "outlet_region", "domain_resolver"}
+
+    def _scan_nodes(self):
+        """纯读盘 + 去重，返回节点列表。每个节点：{id, tag, type, server, port, subgroup, outbound}。
+        优先从订阅文件（karing_subscribe.json）的 items[].servers 提取——其 server 项含完整
+        sing-box 连接字段且自带订阅分组，能拿到全部订阅的全部节点（即使 service_core.json
+        滞后未含某些订阅）；无订阅文件或其无 servers 时 fallback 到 service_core.json 的
+        outbounds（兼容非 Karing 来源，如 clash-verge）。"""
+        self.subgroups = {}
+        nodes = self._scan_from_subscribe()
+        if not nodes:
+            nodes = self._scan_from_core()
+        return nodes
+
+    def _scan_from_subscribe(self):
+        """从 karing_subscribe.json 的 items[].servers 提取节点（主路径）。
+        server 项去掉 Karing 元数据字段后即为合法 sing-box outbound（已验证）。
+        subgroup 直接取所在 item 的 remark，无需 tag 反查。按 tag 去重。"""
+        if not (self.sub_path and os.path.exists(self.sub_path)):
+            return []
+        try:
             with open(self.sub_path, "r", encoding="utf-8") as f:
                 sub = json.load(f)
-            for item in sub.get("items", []):
-                gid = item.get("groupid", "")
-                remark = item.get("remark", "") or gid
-                self.subgroups[gid] = remark
-                for s in item.get("servers", []):
-                    tag_to_sub[s.get("tag", "")] = remark
+        except Exception:
+            return []
+        nodes = []
         seen = set()
-        for ob in core.get("outbounds", []):
-            t = ob.get("type", "")
-            if t in PROXY_TYPES:
-                tag = ob.get("tag", t)
+        for item in sub.get("items", []):
+            gid = item.get("groupid", "")
+            remark = item.get("remark", "") or gid or "未知"
+            self.subgroups[gid] = remark
+            for s in item.get("servers", []):
+                outbound = {k: v for k, v in s.items() if k not in self._SUB_DROP_KEYS}
+                t = outbound.get("type", "")
+                if t not in PROXY_TYPES:
+                    continue
+                tag = s.get("tag", "") or t
                 if tag in seen:
                     continue
                 seen.add(tag)
-                self.nodes.append({
+                nodes.append({
+                    "id": make_id(outbound),
                     "tag": tag,
                     "type": t,
-                    "server": ob.get("server", ""),
-                    "port": ob.get("server_port") or ob.get("server_ports") or "",
-                    "subgroup": tag_to_sub.get(tag, "未知"),
-                    "outbound": ob,
+                    "server": outbound.get("server", ""),
+                    "port": outbound.get("server_port") or outbound.get("server_ports") or "",
+                    "subgroup": remark,
+                    "outbound": outbound,
                 })
-                self.results[tag] = self._blank()
+        return nodes
+
+    def _scan_from_core(self):
+        """fallback：从 service_core.json 的 outbounds 提取（非 Karing 来源）。
+        订阅分组通过 tag 反查 subscribe（若有）；无则为'未知'。按 tag 去重。"""
+        try:
+            with open(self.core_path, "r", encoding="utf-8") as f:
+                core = json.load(f)
+        except Exception:
+            return []
+        tag_to_sub = {}
+        if self.sub_path and os.path.exists(self.sub_path):
+            try:
+                with open(self.sub_path, "r", encoding="utf-8") as f:
+                    sub = json.load(f)
+                for item in sub.get("items", []):
+                    gid = item.get("groupid", "")
+                    remark = item.get("remark", "") or gid or "未知"
+                    self.subgroups[gid] = remark
+                    for s in item.get("servers", []):
+                        tag_to_sub[s.get("tag", "")] = remark
+            except Exception:
+                pass
+        nodes = []
+        seen = set()
+        for ob in core.get("outbounds", []):
+            t = ob.get("type", "")
+            if t not in PROXY_TYPES:
+                continue
+            tag = ob.get("tag", t)
+            if tag in seen:
+                continue
+            seen.add(tag)
+            nodes.append({
+                "id": make_id(ob),
+                "tag": tag,
+                "type": t,
+                "server": ob.get("server", ""),
+                "port": ob.get("server_port") or ob.get("server_ports") or "",
+                "subgroup": tag_to_sub.get(tag, "未知"),
+                "outbound": ob,
+            })
+        return nodes
+
+    def _apply_nodes(self, new_nodes):
+        """合并新节点列表：保留同 tag 的旧 result、新增 _blank、丢弃消失的 tag。
+        必须在 self.lock 内调用。logs 不裁剪（按 tag 保留旧的）。"""
+        with self.lock:
+            old_results = self.results
+            self.nodes = new_nodes
+            new_results = {}
+            for n in new_nodes:
+                new_results[n["tag"]] = old_results.get(n["tag"]) or self._blank()
+            self.results = new_results
+
+    def reload(self):
+        """重新扫描配置源并合并节点列表。必须在非测速状态调用（HTTP 层守卫）。"""
+        with self.lock:
+            self._apply_nodes(self._scan_nodes())
 
     def _blank(self):
         return {"status": "pending", "phase": "", "speed_mbps": 0, "speed_MBps": 0,
@@ -242,11 +511,11 @@ class SpeedTest:
         except Exception:
             return 0, -1, "000", 0, 0
 
-    def _curl_stream(self, proxy, url, total_bytes, timeout, tag):
+    def _curl_stream(self, proxy, url, total_bytes, timeout, node_id):
         """流式下载：curl 后台下载到临时文件，主线程周期采样文件大小计算实时速度。
         返回 (speed_Bps, http_code, dl_bytes, ul_bytes)。"""
         import hashlib
-        out_path = os.path.join(self.tmp_dir, "dl_" + hashlib.md5(tag.encode()).hexdigest()[:8] + ".bin")
+        out_path = os.path.join(self.tmp_dir, "dl_" + hashlib.md5(node_id.encode()).hexdigest()[:8] + ".bin")
         try:
             os.remove(out_path)
         except OSError:
@@ -279,7 +548,7 @@ class SpeedTest:
             if inst_spd > 0 and cur_size > last_size:
                 spd_samples.append(inst_spd)
             if now - last_logged >= 0.4 or rc is not None:
-                self._set(tag, phase=f"下载中 {pct:.0f}% ({inst_spd/1024/1024:.1f}MB/s)",
+                self._set(node_id, phase=f"下载中 {pct:.0f}% ({inst_spd/1024/1024:.1f}MB/s)",
                           dl_progress=round(pct, 1), cur_speed=round(inst_spd * 8 / 1_000_000, 1),
                           peak_speed=round(peak_Bps * 8 / 1_000_000, 1))
                 last_logged = now
@@ -430,16 +699,22 @@ class SpeedTest:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(do, nodes))
 
-    def _record_fail(self, tag, reason):
-        """记录失败到历史（用于判断节点稳定性）"""
+    def _record_fail(self, node, reason):
+        """记录失败到历史（用于判断节点稳定性）。history key 用 node["id"]，
+        访问当前 results 用 tag；rec 附带节点快照字段（id/tag/type/server/port）
+        便于历史展示。"""
+        nid = node["id"]
+        tag = node["tag"]
         rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "speed_mbps": 0,
                "speed_MBps": 0, "latency_ms": self.results.get(tag, {}).get("latency_ms", 0),
                "ip": self.results.get(tag, {}).get("ip", ""), "dl_bytes": 0,
-               "source": "fail", "result": "fail", "error": reason}
+               "source": "fail", "result": "fail", "error": reason,
+               "id": nid, "tag": node["tag"], "type": node["type"],
+               "server": node["server"], "port": node["port"]}
         with self.lock:
-            self.history.setdefault(tag, []).append(rec)
-            if len(self.history[tag]) > 50:
-                self.history[tag] = self.history[tag][-50:]
+            self.history.setdefault(nid, []).append(rec)
+            if len(self.history[nid]) > 50:
+                self.history[nid] = self.history[nid][-50:]
             self._save_history()
 
     # -------- 单节点测速 --------
@@ -476,7 +751,7 @@ class SpeedTest:
                 reason = "节点不可用" if code == "000" else f"连接被拒(http={code})"
                 self._set(tag, status="error", phase="", latency_ms=-1, error=reason)
                 self._log(tag, f"连接失败: {reason}")
-                self._record_fail(tag, reason)
+                self._record_fail(node, reason)
                 return
             # 测速连通延迟不覆盖 ping 多次最小值（ping 更准），仅 ping 未测过时才设
             cur_lat = self.results.get(tag, {}).get("latency_ms", 0)
@@ -535,7 +810,7 @@ class SpeedTest:
                     fail_reason = "下载连接超时/无响应"
                 self._set(tag, status="error", phase="", error=fail_reason)
                 self._log(tag, f"测速失败: {fail_reason}")
-                self._record_fail(tag, fail_reason)
+                self._record_fail(node, fail_reason)
                 return
             with self.lock:
                 self.total_dl += dl
@@ -546,16 +821,19 @@ class SpeedTest:
                       speed_MBps=round(MBps, 2), peak_speed=peak_mbps, avg_speed=avg_mbps,
                       dl_bytes=dl, ul_bytes=ul, dl_progress=100)
             self._log(tag, f"完成: 均{avg_mbps} 峰{peak_mbps} Mbps ({MBps:.2f} MB/s) [{used_url}], 流量 ↓{dl//1024}KB")
-            # 记录历史（成功）
+            # 记录历史（成功）—— history key 用 node["id"]，访问当前 results 用 tag
+            nid = node["id"]
             rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "speed_mbps": round(mbps, 1),
                    "speed_MBps": round(MBps, 2), "avg_speed": avg_mbps, "peak_speed": peak_mbps,
                    "latency_ms": self.results[tag].get("latency_ms", 0),
                    "ip": self.results[tag].get("ip", ""), "ip_geo": self.results[tag].get("ip_geo", ""),
-                   "dl_bytes": dl, "source": used_url, "result": "ok"}
+                   "dl_bytes": dl, "source": used_url, "result": "ok",
+                   "id": nid, "tag": node["tag"], "type": node["type"],
+                   "server": node["server"], "port": node["port"]}
             with self.lock:
-                self.history.setdefault(tag, []).append(rec)
-                if len(self.history[tag]) > 50:
-                    self.history[tag] = self.history[tag][-50:]
+                self.history.setdefault(nid, []).append(rec)
+                if len(self.history[nid]) > 50:
+                    self.history[nid] = self.history[nid][-50:]
                 self._save_history()
         except Exception as e:
             self._set(tag, status="error", phase="", error=str(e)[:100])
@@ -700,6 +978,7 @@ td.tag-cell{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:n
   <label class="lbl">Ping<input type="number" id="cfgPC" value="5" min="1" max="20" onchange="saveCfg()">次</label>
   <span class="cfg-tip" id="cfgUrl"></span>
   <span class="sep"></span>
+  <button class="btn btn-ghost" id="bReload" onclick="reloadCfg()">↻ 重新载入</button>
   <button class="btn btn-ok" id="bPing" onclick="doPing('sb')">⚡ Ping延迟</button>
   <button class="btn btn-warn" id="bTcp" onclick="doPing('tcp')">🔌 TCP探测</button>
   <button class="btn btn-pri" id="bGo" onclick="startTest()">🚀 开始测速</button>
@@ -804,7 +1083,7 @@ function rend(){
   const er=Object.values(results).filter(r=>r.status==='error').length;
   const avg=dn?(Object.values(results).filter(r=>r.status==='done').reduce((s,r)=>s+(r.speed_mbps||0),0)/dn).toFixed(1):0;
   $('st').innerHTML='共 '+nodes.length+' · 选 <b>'+selected.size+'</b> · 成功 <b>'+dn+'</b> · 失败 '+er+' · 均 <b>'+avg+'</b>Mbps'+(prog.total?' · '+prog.done+'/'+prog.total:'');
-  $('bGo').disabled=(state==='testing'||state==='pinging');$('bPing').disabled=(state==='testing'||state==='pinging');$('bTcp').disabled=(state==='testing'||state==='pinging');
+  $('bGo').disabled=(state==='testing'||state==='pinging');$('bPing').disabled=(state==='testing'||state==='pinging');$('bTcp').disabled=(state==='testing'||state==='pinging');$('bReload').disabled=(state==='testing'||state==='pinging');
   $('bStop').disabled=(state==='idle'||state==='done'||state==='stopping');
   $('pg').style.width=prog.total?(prog.done/prog.total*100)+'%':'0%';
 }
@@ -819,17 +1098,17 @@ document.getElementById('tb').addEventListener('click',function(e){
   const act=actEl.getAttribute('data-act');
   if(act==='ck'){if(selected.has(tag))selected.delete(tag);else selected.add(tag);rend();}
   else if(act==='detail'){detail(tag);}
-  else if(act==='history'){history(tag);}
+  else if(act==='history'){const nd=nodes.find(x=>x.tag===tag);history(nd?nd.id:'');}
 });
 async function saveCfg(){
   const mb=parseInt($('cfgMB').value)||10,to=parseInt($('cfgTO').value)||25,pc=parseInt($('cfgPC').value)||5;
   cfg.dl_bytes=mb*1048576;cfg.timeout=to;cfg.ping_count=pc;
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dl_bytes:cfg.dl_bytes,timeout:to,ping_count:pc})});
 }
-function detail(t){const r=results[t]||{};const n=nodes.find(x=>x.tag===t)||{};
-  $('mtitle').textContent=t;
+function detail(tag){const r=results[tag]||{};const n=nodes.find(x=>x.tag===tag)||{};
+  $('mtitle').textContent=n.tag||tag;
   const logs=(r.log||[]).map(l=>{const cls=l.includes('失败')||l.includes('错误')||l.includes('异常')?'err':(l.includes('完成')||l.includes('OK')?'ok':'');return '<div class="logline '+cls+'">'+esc(l)+'</div>';}).join('');
-  $('mbody').innerHTML='<div class="kv"><span>节点</span><b>'+esc(t)+'</b></div>'+
+  $('mbody').innerHTML='<div class="kv"><span>节点</span><b>'+esc(n.tag||tag)+'</b></div>'+
     '<div class="kv"><span>服务器</span><b>'+esc(n.server||'-')+':'+esc(n.port||'-')+'</b></div>'+
     '<div class="kv"><span>订阅</span><b>'+esc(n.subgroup||'-')+'</b></div>'+
     '<div class="kv"><span>协议</span><b>'+(n.type||'-')+'</b></div>'+
@@ -843,12 +1122,15 @@ function detail(t){const r=results[t]||{};const n=nodes.find(x=>x.tag===t)||{};
     '<div class="kv"><span>状态</span><b>'+(r.status||'-')+(r.error?' · <span style="color:var(--err)">'+esc(r.error)+'</span>':'')+'</b></div>'+
     '<hr style="margin:10px 0;border:none;border-top:1px solid var(--bd)"><div style="font-weight:700;margin-bottom:8px">📋 阶段日志</div>'+logs;
   $('mbg').classList.add('show');}
-async function history(t){const r=results[t]||{};const n=nodes.find(x=>x.tag===t)||{};
-  $('mtitle').textContent='历史 · '+t;
-  const rr=await(await fetch('/api/history?tag='+encodeURIComponent(t))).json();
+async function history(id){const n=nodes.find(x=>x.id===id)||{};const r=results[n.tag]||{};
+  $('mtitle').textContent='历史 · '+(n.tag||id);
+  const rr=await(await fetch('/api/history?id='+encodeURIComponent(id))).json();
   const recs=rr.records||[];
+  // 节点快照副标题（若有 type/server/port）
+  const snap=(n.type||n.server||n.port)?((n.type||'')+' · '+(n.server||'')+':'+(n.port||'')):'';
+  let html='<div class="kv"><span>总记录</span><b>'+recs.length+' 次</b> <span style="color:var(--ok)">成功 '+recs.filter(x=>x.result!=='fail').length+'</span> <span style="color:var(--err)">失败 '+(recs.length-recs.filter(x=>x.result!=='fail').length)+'</span></div>';
+  if(snap)html+='<div class="kv"><span>节点</span><b style="font-size:11px;color:var(--txt3)">'+esc(snap)+'</b></div>';
   const okRecs=recs.filter(x=>x.result!=='fail');
-  let html='<div class="kv"><span>总记录</span><b>'+recs.length+' 次</b> <span style="color:var(--ok)">成功 '+okRecs.length+'</span> <span style="color:var(--err)">失败 '+(recs.length-okRecs.length)+'</span></div>';
   if(okRecs.length){
     const speeds=okRecs.map(x=>x.speed_mbps);
     const avg=(speeds.reduce((a,b)=>a+b,0)/speeds.length).toFixed(1);
@@ -878,7 +1160,7 @@ async function history(t){const r=results[t]||{};const n=nodes.find(x=>x.tag===t
 function closeModal(){$('mbg').classList.remove('show');}
 async function api(path,opts){const r=await fetch(path,opts);return r.json();}
 async function load(){const d=await api('/api/init');nodes=d.nodes;results=d.results;state=d.state;
-  const sf=$('sf');(d.subgroups||[]).forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sf.appendChild(o);});
+  const sf=$('sf');while(sf.options.length>1)sf.remove(1);(d.subgroups||[]).forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sf.appendChild(o);});
   flow=d.flow;
   const c=await api('/api/config');cfg=c;$('cfgMB').value=Math.round(c.dl_bytes/1048576);$('cfgTO').value=c.timeout;$('cfgPC').value=c.ping_count||5;
   $('cfgUrl').textContent='🔄 '+(c.speedtest_urls||[]).length+'源自动降级';
@@ -888,6 +1170,7 @@ async function poll(){clearInterval(pt);pt=setInterval(async()=>{const d=await a
 async function doPing(m){const ts=vis().filter(n=>selected.has(n.tag)).map(n=>n.tag);if(!ts.length){alert('请先勾选节点');return;}await saveCfg();const pc=parseInt($('cfgPC').value)||5;await api('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tags:ts,mode:m,count:pc})});poll();}
 async function startTest(){const ts=vis().filter(n=>selected.has(n.tag)).map(n=>n.tag);if(!ts.length){alert('请先勾选要测速的节点');return;}await saveCfg();await api('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tags:ts})});poll();}
 async function stopAll(){await api('/api/stop',{method:'POST'});}
+async function reloadCfg(){if(state==='testing'||state==='pinging'){alert('测速进行中，请先停止');return;}const r=await api('/api/reload',{method:'POST'});if(r&&r.ok){selected=new Set();await load();}else{alert((r&&r.error)||'重载失败');}}
 load();
 </script></body></html>"""
 
@@ -915,7 +1198,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/init":
             subs = sorted(set(n["subgroup"] for n in t.nodes))
             self._json(200, {
-                "nodes": [{"tag": n["tag"], "type": n["type"], "subgroup": n["subgroup"],
+                "nodes": [{"id": n["id"], "tag": n["tag"], "type": n["type"], "subgroup": n["subgroup"],
                            "server": n["server"], "port": n["port"]} for n in t.nodes],
                 "results": t.results, "state": t.state,
                 "subgroups": subs,
@@ -932,9 +1215,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/history"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
-            tag = q.get("tag", [""])[0]
-            if tag:
-                self._json(200, {"records": t.history.get(tag, [])})
+            node_id = q.get("id", [""])[0]
+            if node_id:
+                self._json(200, {"records": t.history.get(node_id, [])})
             else:
                 self._json(200, {"history": t.history})
         else:
@@ -959,6 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._json(200, {"ok": True, "dl_bytes": t.dl_bytes, "timeout": t.timeout, "ping_count": t.ping_count})
+            return
         if self.path == "/api/ping":
             if t.state in ("pinging", "testing"):
                 self._json(409, {"error": "忙碌中"}); return
@@ -970,6 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "未选中节点"}); return
             threading.Thread(target=t.ping_all, args=(ns, mode, count), daemon=True).start()
             self._json(200, {"ok": True, "count": len(ns)})
+            return
         elif self.path == "/api/test":
             if t.state in ("pinging", "testing"):
                 self._json(409, {"error": "忙碌中"}); return
@@ -979,9 +1264,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "未选中节点"}); return
             threading.Thread(target=t.run_test, args=(ns,), daemon=True).start()
             self._json(200, {"ok": True, "count": len(ns)})
+            return
         elif self.path == "/api/stop":
             t.stop()
             self._json(200, {"ok": True})
+            return
+        elif self.path == "/api/reload":
+            if t.state in ("pinging", "testing"):
+                self._json(409, {"error": "测速进行中，请先停止"}); return
+            try:
+                t.reload()
+            except Exception as e:
+                self._json(500, {"error": f"重载失败: {e}"}); return
+            self._json(200, {"ok": True, "count": len(t.nodes)})
+            return
         else:
             self.send_error(404)
 
@@ -1020,22 +1316,31 @@ def main():
         for s in (sys.stdout, sys.stderr):
             try: s.reconfigure(encoding="utf-8")
             except Exception: pass
-    core = args.core or os.path.join(DEFAULT_KARING_DIR, CORE_JSON)
-    sub = args.subscribe or os.path.join(DEFAULT_KARING_DIR, SUB_JSON)
-    if not os.path.exists(core):
-        print(f"找不到配置: {core}"); sys.exit(1)
+    core = resolve_core_path(args.core, args.config_dir)
+    if not core or not os.path.exists(core):
+        print("找不到配置文件。请将 service_core.json 放入项目 config/ 目录，或用 --core / --config-dir 指定。")
+        sys.exit(1)
+    sub = resolve_sub_path(args.subscribe, args.config_dir)
     sb = args.singbox or find_singbox()
-    if not os.path.exists(sb):
+    if not sb or not os.path.exists(sb):
         print(f"找不到 sing-box: {sb}"); sys.exit(1)
-    print(f"配置: {core}\nsing-box: {sb}")
-    t = SpeedTest(core, sub, sb, args.bytes, args.timeout)
+    history_path = resolve_history_path(args.history)
+    print(f"配置: {core}\n订阅: {sub}\nsing-box: {sb}\n历史: {history_path}")
+    t = SpeedTest(core, sub, sb, args.bytes, args.timeout, history_path)
     print(f"已加载 {len(t.nodes)} 个节点，订阅分组: {sorted(set(n['subgroup'] for n in t.nodes))}")
     if args.cli:
         run_cli(t, args.filter); return
     Handler.tester = t
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    ip = get_local_ip()
-    print(f"\n✓ Web 界面:\n  http://127.0.0.1:{args.port}\n  http://{ip}:{args.port}\n")
+    # 阶段 0 / Section 16.1 & 17.6：在引入阶段 5 的 CSRF/Origin/token/敏感字段权限前，
+    # 仅允许回环地址监听，避免将未认证的 Web 接口暴露到局域网。
+    # TODO(阶段 5): 实现认证与安全设计后，可解除此限制。
+    if not _is_loopback(args.host):
+        print("拒绝启动：非回环监听地址 '%s' 需要阶段 5 的认证与安全设计（CSRF/Origin/token/敏感字段权限），"
+              "当前版本仅允许 127.0.0.1。" % args.host)
+        sys.exit(1)
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    # Section 16.1：启动日志只显示实际绑定地址，不打印带敏感信息的 URL（不再展示 LAN 地址）
+    print(f"\n✓ Web 界面: http://{args.host}:{args.port}\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
