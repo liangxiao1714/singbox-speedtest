@@ -1,0 +1,9 @@
+version: 1
+delivery: issue1
+context:
+  kind: branch
+  branch: feat/1-issue1
+issues:
+  - 1
+  - 2
+pr: 3

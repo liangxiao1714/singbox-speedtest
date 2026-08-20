@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -59,22 +60,19 @@ PROXY_TYPES = {"vless", "vmess", "trojan", "hysteria", "hysteria2", "shadowsocks
 
 def find_singbox():
     # 按优先级查找 sing-box：PATH → v2rayN 常见安装位置
-    candidates = [
-        "sing-box",  # 系统 PATH（Linux/macOS/已加入PATH的Windows）
-        "sing-box.exe",
+    for name in ("sing-box", "sing-box.exe"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for c in (
         # v2rayN 常见安装位置（Windows）
         r"D:\v2rayN-windows-64\bin\sing_box\sing-box.exe",
         r"C:\v2rayN\bin\sing_box\sing-box.exe",
         r"C:\Program Files\v2rayN\bin\sing_box\sing-box.exe",
         os.path.expanduser(r"~\v2rayN\bin\sing_box\sing-box.exe"),
-    ]
-    for c in candidates:
-        try:
-            r = subprocess.run([c, "version"], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 or "sing-box" in (r.stdout + r.stderr).lower():
-                return c
-        except Exception:
-            continue
+    ):
+        if os.path.exists(c):
+            return c
     return DEFAULT_SINGBOX
 
 
@@ -195,6 +193,14 @@ class SpeedTest:
             if r is not None:
                 r.update(kw)
 
+    def _stop_aborted(self, tag):
+        """用户点击停止时返回 True，并把当前节点标记为已停止。"""
+        if self.state != "stopping":
+            return False
+        self._set(tag, status="stopped", phase="", error="已停止")
+        self._log(tag, "测速已被用户停止")
+        return True
+
     def _gen_cfg(self, node, port):
         ob = dict(node["outbound"])
         ob["tag"] = "__t__"
@@ -224,15 +230,29 @@ class SpeedTest:
         BASE_PORT += 1
         return BASE_PORT
 
+    def _run_curl(self, args, timeout):
+        """运行 curl 子进程（可被停止中断）。返回 (returncode, stdout_bytes)。"""
+        full = ["curl", "-s"] + args + ["--max-time", str(timeout)]
+        proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                creationflags=0x08000000 if sys.platform == "win32" else 0)
+        t0 = time.time()
+        while proc.poll() is None:
+            time.sleep(0.1)
+            if self.state == "stopping" or time.time() - t0 > timeout + 5:
+                proc.kill()
+                break
+        out, _ = proc.communicate()
+        return proc.returncode, out
+
     def _curl(self, proxy, url, timeout, write_out=True):
         """返回 (speed_Bps, latency_ms, http_code, dl_bytes, ul_bytes)"""
         w = "%{http_code}|%{time_total}|%{speed_download}|%{size_download}|%{size_upload}" if write_out else \
             "%{http_code}|%{time_total}|%{speed_download}"
         try:
-            r = subprocess.run(
-                ["curl", "-s", "-x", proxy, "-o", os.devnull, "-w", w, "--max-time", str(timeout), url],
-                capture_output=True, text=True, timeout=timeout + 5)
-            parts = r.stdout.strip().split("|")
+            rc, out = self._run_curl(["-x", proxy, "-o", os.devnull, "-w", w, url], timeout)
+            if self.state == "stopping":
+                return 0, -1, "000", 0, 0
+            parts = out.decode("utf-8", "ignore").strip().split("|")
             code = parts[0]
             t = float(parts[1]) if len(parts) > 1 else 0
             spd = float(parts[2]) if len(parts) > 2 else 0
@@ -244,7 +264,9 @@ class SpeedTest:
 
     def _curl_stream(self, proxy, url, total_bytes, timeout, tag):
         """流式下载：curl 后台下载到临时文件，主线程周期采样文件大小计算实时速度。
-        返回 (speed_Bps, http_code, dl_bytes, ul_bytes)。"""
+        返回 (speed_Bps, http_code, dl_bytes, ul_bytes, peak_mbps, avg_mbps, timed_out)。
+        timed_out=True 表示超过总超时仍未下载完（dl_bytes 可能仍有部分数据）。
+        被用户停止时同样立即终止 curl 并返回（由调用方检查 state）。"""
         import hashlib
         out_path = os.path.join(self.tmp_dir, "dl_" + hashlib.md5(tag.encode()).hexdigest()[:8] + ".bin")
         try:
@@ -262,6 +284,7 @@ class SpeedTest:
         last_t = t0
         peak_Bps = 0.0
         spd_samples = []
+        timed_out = False
         while True:
             time.sleep(0.3)
             rc = proc.poll()
@@ -286,8 +309,14 @@ class SpeedTest:
             last_size = cur_size
             last_t = now
             if rc is not None:
+                if rc == 28:  # curl 因 --max-time 超时退出
+                    timed_out = True
                 break
-            if now - t0 > timeout:
+            if self.state == "stopping":   # 用户点击停止 → 立即终止当前下载
+                proc.terminate()
+                break
+            if now - t0 > timeout:         # 慢速节点：总超时兜底
+                timed_out = True
                 proc.terminate()
                 break
         try:
@@ -303,12 +332,14 @@ class SpeedTest:
             os.remove(out_path)
         except OSError:
             pass
+        if total_bytes and dl_size >= total_bytes:
+            timed_out = False  # 已完整下载，不算超时
         elapsed = max(0.1, time.time() - t0)
         spd = dl_size / elapsed if dl_size else 0
         peak_mbps = round(peak_Bps * 8 / 1_000_000, 1) if peak_Bps else 0
         avg_mbps = round((sum(spd_samples) / len(spd_samples) * 8 / 1_000_000), 1) if spd_samples else round(spd * 8 / 1_000_000, 1)
         code = "200" if (proc.returncode == 0 and dl_size > 0) else ("000" if dl_size == 0 else "200")
-        return spd, code, dl_size, 0, peak_mbps, avg_mbps
+        return spd, code, dl_size, 0, peak_mbps, avg_mbps, timed_out
 
     # -------- TCP 端口探测 --------
     def _tcp_probe(self, node, timeout=4):
@@ -455,6 +486,8 @@ class SpeedTest:
         proc = None
         try:
             chk = subprocess.run([self.singbox, "check", "-c", cfg_path], capture_output=True, text=True, timeout=10)
+            if self._stop_aborted(tag):
+                return
             if chk.returncode != 0:
                 err = (chk.stderr.strip().split("\n")[-1][:100]) if chk.stderr else "配置错误"
                 self._set(tag, status="error", phase="", error=err)
@@ -467,11 +500,15 @@ class SpeedTest:
             proc = subprocess.Popen([self.singbox, "run", "-c", cfg_path],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=si)
             time.sleep(1.5)
+            if self._stop_aborted(tag):
+                return
             proxy = f"http://127.0.0.1:{port}"
             # 连通
             self._set(tag, phase="连接中…")
             self._log(tag, "测试连通性 (generate_204)…")
             _, lat, code, _, _ = self._curl(proxy, LATENCY_URL, min(10, self.timeout))
+            if self._stop_aborted(tag):
+                return
             if code not in ("200", "204"):
                 reason = "节点不可用" if code == "000" else f"连接被拒(http={code})"
                 self._set(tag, status="error", phase="", latency_ms=-1, error=reason)
@@ -486,10 +523,11 @@ class SpeedTest:
             # 获取出口IP + 地理位置/ISP（ip-api.com 免费、无需 key）
             self._set(tag, phase="获取出口IP…")
             try:
-                r = subprocess.run(["curl", "-s", "-x", proxy, "--max-time", "8", IP_URL],
-                                   capture_output=True, text=True, timeout=12)
-                if r.returncode == 0 and r.stdout.strip():
-                    data = json.loads(r.stdout)
+                rc, out = self._run_curl(["-x", proxy, IP_URL], 8)
+                if self._stop_aborted(tag):
+                    return
+                if rc == 0 and out.strip():
+                    data = json.loads(out.decode("utf-8", "ignore"))
                     ip = data.get("query") or data.get("ip") or ""
                     if ip:
                         geo_parts = []
@@ -505,58 +543,78 @@ class SpeedTest:
                         self._log(tag, f"出口IP: {ip} ({geo})")
             except Exception:
                 pass
-            # 下载测速（多源自动降级 + 流式实时进度）
+            # 下载测速（多源自动降级 + 流式实时进度；慢速节点由总超时兜底并记录）
             self._set(tag, phase=f"下载中 0%", dl_progress=0, cur_speed=0)
-            self._log(tag, f"下载测速 ({self.dl_bytes // 1048576}MB)…")
+            self._log(tag, f"下载测速 ({self.dl_bytes // 1048576}MB, 超时{self.timeout}s)…")
             min_valid = max(500_000, self.dl_bytes // 4)  # 至少下到 1/4 才算有效（防截断）
             spd, code, dl, ul = 0, "000", 0, 0
             peak_mbps, avg_mbps = 0, 0
             used_url = ""
+            timed_out = False
             for tpl in SPEEDTEST_URLS:
+                if self.state == "stopping":
+                    break
                 if "{bytes}" in tpl:
                     url = tpl.format(bytes=self.dl_bytes)
                 else:
                     url = tpl  # 固定大小源
                 src_name = url.split("/")[2]
                 self._log(tag, f"尝试测速源: {src_name}")
-                spd, code, dl, ul, peak_mbps, avg_mbps = self._curl_stream(proxy, url, self.dl_bytes, self.timeout, tag)
-                self._log(tag, f"  {src_name}: code={code} dl={dl//1024}KB 均{avg_mbps}M/峰{peak_mbps}M")
+                spd, code, dl, ul, peak_mbps, avg_mbps, timed_out = self._curl_stream(proxy, url, self.dl_bytes, self.timeout, tag)
+                self._log(tag, f"  {src_name}: code={code} dl={dl//1024}KB 均{avg_mbps}M/峰{peak_mbps}M" +
+                          (" [超时]" if timed_out else ""))
+                if self._stop_aborted(tag):
+                    return
+                # 慢速节点：超过总超时仍未下载完但已有数据 → 结束测试并按实际数据记录
+                if timed_out and dl > 0:
+                    used_url = src_name + "(超时)"
+                    self._log(tag, f"超过 {self.timeout}s 仍未下载完 {self.dl_bytes // 1048576}MB，按已下载 {dl // 1024}KB 记录")
+                    break
                 # 有效判定：下到足够数据（非 1 字节截断）
                 if dl >= min_valid and spd > 0:
                     used_url = src_name
                     break
                 self._set(tag, phase=f"下载中 0%", dl_progress=0, cur_speed=0)
-            if dl < min_valid or spd == 0:
+            if self._stop_aborted(tag):
+                return
+            if (timed_out and dl > 0) or (dl >= min_valid and spd > 0):
+                with self.lock:
+                    self.total_dl += dl
+                    self.total_ul += ul
+                mbps = spd * 8 / 1_000_000
+                MBps = spd / (1024 * 1024)
+                self._set(tag, status="done", phase="", speed_mbps=round(mbps, 1),
+                          speed_MBps=round(MBps, 2), peak_speed=peak_mbps, avg_speed=avg_mbps,
+                          dl_bytes=dl, ul_bytes=ul,
+                          dl_progress=100 if not timed_out else round(min(100.0, dl / self.dl_bytes * 100), 1))
+                self._log(tag, f"完成: 均{avg_mbps} 峰{peak_mbps} Mbps ({MBps:.2f} MB/s) [{used_url}], 流量 ↓{dl//1024}KB" +
+                          (" [超时截断]" if timed_out else ""))
+                # 记录历史（成功；超时截断也记录，便于对比慢速节点）
+                rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "speed_mbps": round(mbps, 1),
+                       "speed_MBps": round(MBps, 2), "avg_speed": avg_mbps, "peak_speed": peak_mbps,
+                       "latency_ms": self.results[tag].get("latency_ms", 0),
+                       "ip": self.results[tag].get("ip", ""), "ip_geo": self.results[tag].get("ip_geo", ""),
+                       "dl_bytes": dl, "source": used_url, "result": "ok",
+                       "note": "超时截断" if timed_out else ""}
+                with self.lock:
+                    self.history.setdefault(tag, []).append(rec)
+                    if len(self.history[tag]) > 50:
+                        self.history[tag] = self.history[tag][-50:]
+                    self._save_history()
+            else:
                 # 失败也记录历史（便于判断节点稳定性）
-                fail_reason = "所有测速源均被截断/失败"
-                if dl > 0 and dl < min_valid:
+                if dl == 0 and timed_out:
+                    fail_reason = f"下载超时无数据({self.timeout}s)"
+                elif dl > 0 and dl < min_valid:
                     fail_reason = f"下载被截断(仅{dl//1024}KB/{self.dl_bytes//1024}KB)"
                 elif code == "000":
                     fail_reason = "下载连接超时/无响应"
+                else:
+                    fail_reason = "所有测速源均被截断/失败"
                 self._set(tag, status="error", phase="", error=fail_reason)
                 self._log(tag, f"测速失败: {fail_reason}")
                 self._record_fail(tag, fail_reason)
                 return
-            with self.lock:
-                self.total_dl += dl
-                self.total_ul += ul
-            mbps = spd * 8 / 1_000_000
-            MBps = spd / (1024 * 1024)
-            self._set(tag, status="done", phase="", speed_mbps=round(mbps, 1),
-                      speed_MBps=round(MBps, 2), peak_speed=peak_mbps, avg_speed=avg_mbps,
-                      dl_bytes=dl, ul_bytes=ul, dl_progress=100)
-            self._log(tag, f"完成: 均{avg_mbps} 峰{peak_mbps} Mbps ({MBps:.2f} MB/s) [{used_url}], 流量 ↓{dl//1024}KB")
-            # 记录历史（成功）
-            rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "speed_mbps": round(mbps, 1),
-                   "speed_MBps": round(MBps, 2), "avg_speed": avg_mbps, "peak_speed": peak_mbps,
-                   "latency_ms": self.results[tag].get("latency_ms", 0),
-                   "ip": self.results[tag].get("ip", ""), "ip_geo": self.results[tag].get("ip_geo", ""),
-                   "dl_bytes": dl, "source": used_url, "result": "ok"}
-            with self.lock:
-                self.history.setdefault(tag, []).append(rec)
-                if len(self.history[tag]) > 50:
-                    self.history[tag] = self.history[tag][-50:]
-                self._save_history()
         except Exception as e:
             self._set(tag, status="error", phase="", error=str(e)[:100])
             self._log(tag, f"异常: {e}")
@@ -650,6 +708,7 @@ td.tag-cell{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:n
 .pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap}
 .p-testing{background:var(--pri-bg);color:var(--pri)}.p-pending{background:#f1f5f9;color:var(--txt3)}
 .p-done{background:var(--ok-bg);color:var(--ok)}.p-error{background:var(--err-bg);color:var(--err)}
+.p-stopped{background:#f1f5f9;color:var(--txt2)}
 .phase{font-size:10px;color:var(--pri);margin-top:3px;font-weight:500}
 /* 延迟颜色分级 */
 .lat{font-weight:600;font-variant-numeric:tabular-nums}
@@ -772,17 +831,17 @@ function rend(){
     let spdPct=r.speed_mbps?Math.min(100,r.speed_mbps/mx*100):0;
     let dlPct=r.dl_progress||0;
     const fast=r.speed_mbps>mx*0.5?' fast':'';
-    const failBar=r.status==='error'?' fail':'';
+    const failBar=(r.status==='error'||r.status==='stopped')?' fail':'';
     let barW=testing?(dlPct||0):spdPct;
     let barTxt=testing?(r.cur_speed>0?r.cur_speed+'M':(dlPct>0?dlPct.toFixed(0)+'%':'…')):(r.speed_mbps?spdPct.toFixed(0)+'%':(r.status==='error'?'✕':''));
     let stTxt=r.status,pill='p-'+r.status,phs='';
     if(stTxt==='testing'){stTxt='<span class="spin"></span>测速中';if(r.phase)phs='<div class="phase">'+esc(r.phase)+'</div>';}
-    else if(stTxt==='pending')stTxt='待测';else if(stTxt==='done')stTxt='✓ 完成';else if(stTxt==='error')stTxt='✕ 失败';
+    else if(stTxt==='pending')stTxt='待测';else if(stTxt==='done')stTxt='✓ 完成';else if(stTxt==='error')stTxt='✕ 失败';else if(stTxt==='stopped')stTxt='⏹ 已停止';
     // 速度格：测试中显瞬时，完成显 均/峰/流量
     let spdTxt;
     if(testing){spdTxt=r.cur_speed>0?'<b style="color:var(--pri)">'+r.cur_speed+'</b> Mbps':(r.phase||'…');}
     else if(r.speed_mbps>0){spdTxt='<b>'+r.speed_mbps+'</b> Mbps';if(r.peak_speed||r.avg_speed){spdTxt+=' <span style="color:var(--txt3);font-size:10px">(均'+(r.avg_speed||r.speed_mbps)+'/峰'+(r.peak_speed||r.speed_mbps)+')</span>';}if(r.dl_bytes)spdTxt+=' <span style="color:var(--ok);font-size:10px">↓'+fmtBytes(r.dl_bytes)+'</span>';}
-    else{spdTxt=r.status==='error'?'<span style="color:var(--err);font-size:11px">'+esc(r.error||'失败').slice(0,20)+'</span>':'—';}
+    else{spdTxt=(r.status==='error'||r.status==='stopped')?'<span style="color:var(--err);font-size:11px">'+esc(r.error||'失败').slice(0,20)+'</span>':'—';}
     // IP格：不截断，允许换行，点击/悬停看完整信息
     const ipHtml=r.ip?'<div class="ip-cell">'+esc(r.ip)+'</div>'+(r.ip_geo?'<div class="ip-geo" title="'+esc(r.ip_geo)+'">'+esc(r.ip_geo)+'</div>':''):'<span style="color:var(--txt3)">—</span>';
     return '<tr class="'+(sel?'sel':'')+'" data-tag="'+esc(n.tag)+'">'+
@@ -865,7 +924,7 @@ async function history(t){const r=results[t]||{};const n=nodes.find(x=>x.tag===t
       const fail=x.result==='fail';
       html+='<tr'+(isNow?' class="hist-now"':'')+(fail?' class="hist-fail"':'')+'>'+
         '<td>'+esc(x.time).slice(5)+'</td>'+
-        '<td>'+(fail?'<span style="color:var(--err)">✕ 失败</span>':'<span style="color:var(--ok)">✓ 成功</span>')+'</td>'+
+        '<td>'+(fail?'<span style="color:var(--err)">✕ 失败</span>':'<span style="color:var(--ok)">✓ 成功</span>'+(x.note?' <span style="color:var(--warn);font-size:10px">('+esc(x.note)+')</span>':''))+'</td>'+
         '<td>'+(fail?'-':'<b>'+x.speed_mbps+'</b> Mbps')+'</td>'+
         '<td>'+(x.latency_ms||'-')+'ms</td>'+
         '<td style="font-family:monospace;font-size:11px">'+(x.ip||'-')+'</td>'+
