@@ -23,20 +23,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
-
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '20.19.0'
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build CLI
-        run: pnpm run build
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
@@ -51,9 +41,17 @@ jobs:
         run: |
           node --input-type=module <<'EOF'
           import { readFileSync } from 'node:fs';
-          import { parse } from 'yaml';
-          const policy = parse(readFileSync('spec_git/policy.yaml', 'utf8'));
-          const required = policy.required_checks ?? [];
+          // Fixed-format list parse: required_checks entries are the
+          // '- name' lines that follow the 'required_checks:' key.
+          const text = readFileSync('spec_git/policy.yaml', 'utf8');
+          const section = text.split('required_checks:')[1] ?? '';
+          const required = [...section.matchAll(/^\s*-\s*(.+?)\s*$/gm)]
+            .map((m) => m[1].replace(/^['"]|['"]$/g, ''))
+            .filter((n) => n.length > 0);
+          if (required.length === 0) {
+            console.log('No required checks declared — nothing to wait for.');
+            process.exit(0);
+          }
           const headers = {
             authorization: 'Bearer ' + process.env.GH_TOKEN,
             accept: 'application/vnd.github+json',
@@ -85,6 +83,6 @@ jobs:
           EOF
 
       - name: specgit finish
-        run: node bin/specgit.js finish --json
+        run: npx -y specgit@0.4.0 finish --json
         env:
           GH_TOKEN: ${{ github.token }}
